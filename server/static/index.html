@@ -565,7 +565,7 @@
     const gpu = d.gpu || {};
     setNum($("gpu-pct"), Math.round(gpu.usage ?? 0), "%");
     $("gpu-model").textContent = gpu.model || "—";
-    $("gpu-clk").textContent = (gpu.sclk_mhz ? gpu.sclk_mhz + " MHz" : "");
+    $("gpu-clk").textContent = (gpu.sclk_mhz != null ? gpu.sclk_mhz + " MHz" : "—");
     const te = gpu.temp_edge, tj = gpu.temp_junction, tm = gpu.temp_mem;
     $("gpu-temps").textContent = [te, tj, tm].map(t => t != null ? t.toFixed(0) + "°" : "—").join(" / ");
     $("gpu-temps").className = "v";
