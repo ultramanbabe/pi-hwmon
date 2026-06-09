@@ -1,4 +1,4 @@
-# pi-vitals
+# pi-hwmon
 
 Always-on hardware monitor for a Linux desktop, displayed on a tiny Pi-driven side screen.
 
