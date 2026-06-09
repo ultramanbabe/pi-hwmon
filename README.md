@@ -70,10 +70,8 @@ export CPU_FAN_INPUT="fan1_input"   # which nct6687 fan is the CPU
 
 3×2 grid sized for 1024×600 at ~65 cm viewing distance:
 
-```
-[ CPU       ] [ GPU         ] [ RAM       ]
-[ VRAM      ] [ Network     ] [ Disk      ]
-```
+<img width="2560" height="1440" alt="Screenshot_20260609_083612" src="https://github.com/user-attachments/assets/3dab2f19-832a-46b0-99c7-6dece9c9adab" />
+
 
 Network card uses 3/4-circle gauges (down + up). Other cards use sparklines. Per-thread CPU bars sit below the % number on the CPU card.
 
