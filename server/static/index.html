@@ -515,8 +515,20 @@
     drawLine(up, cUp);
   }
 
+  // Net/disk rates are genuinely bursty at the 0.5s sample window (TCP sawtooth,
+  // periodic disk writeback), so smooth just those series with a 3-sample rolling
+  // mean (~1.5s). CPU/GPU/VRAM stay raw so they read crisp.
+  const SMOOTH = new Set(["net_up", "net_down", "disk_r", "disk_w"]);
+  const rawWindow = {};   // name -> last few raw samples, for the rolling mean
+
   function pushSeries(name, v) {
     const arr = series[name];
+    if (SMOOTH.has(name)) {
+      const w = (rawWindow[name] ||= []);
+      w.push(v);
+      if (w.length > 3) w.shift();
+      v = w.reduce((a, b) => a + b, 0) / w.length;
+    }
     arr.push(v);
     if (arr.length > HISTORY) arr.shift();
   }
