@@ -20,11 +20,24 @@ def _read(path, default=None, cast=str):
 
 
 def _find_amd_gpu():
+    # The Granite Ridge iGPU binds amdgpu as well, so "first card wins" grabbed it
+    # (512 MB carve-out, permanently ~0% busy) once firmware started enabling it.
+    # Pick the card with the most VRAM, or the slot named in GPU_PCI_SLOT.
+    override = os.environ.get("GPU_PCI_SLOT")
+    best, best_vram = None, -1
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
-        uevent = os.path.join(card, "device", "uevent")
-        if os.path.exists(uevent) and "DRIVER=amdgpu" in open(uevent).read():
-            return os.path.join(card, "device")
-    return None
+        if not re.fullmatch(r"card\d+", os.path.basename(card)):
+            continue
+        dev = os.path.join(card, "device")
+        uevent = _read(os.path.join(dev, "uevent"))
+        if not uevent or "DRIVER=amdgpu" not in uevent:
+            continue
+        if override and os.path.basename(os.path.realpath(dev)).endswith(override):
+            return dev
+        vram = _read(os.path.join(dev, "mem_info_vram_total"), default=0, cast=int)
+        if vram > best_vram:
+            best, best_vram = dev, vram
+    return best
 
 
 def _find_hwmon(name):
@@ -35,6 +48,7 @@ def _find_hwmon(name):
 
 
 GPU_PATH = _find_amd_gpu()
+GPU_PCI_SLOT = os.path.basename(os.path.realpath(GPU_PATH)) if GPU_PATH else None
 GPU_HWMON = None
 if GPU_PATH:
     cands = glob.glob(os.path.join(GPU_PATH, "hwmon/hwmon*"))
@@ -75,8 +89,9 @@ def _detect_gpu_model():
         return override
     if not GPU_PATH:
         return None
+    cmd = ["lspci", "-mm", "-s", GPU_PCI_SLOT] if GPU_PCI_SLOT else ["lspci", "-mm", "-d", "::0300"]
     try:
-        out = subprocess.check_output(["lspci", "-mm", "-d", "::0300"], text=True, timeout=2)
+        out = subprocess.check_output(cmd, text=True, timeout=2)
         for line in out.splitlines():
             parts = re.findall(r'"([^"]+)"', line)
             if len(parts) >= 3:
