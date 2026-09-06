@@ -685,11 +685,13 @@
   // WebSocket with auto-reconnect
   let ws = null;
   let backoff = 500;
+  let lastMsg = 0;
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => { $("dot").classList.add("ok"); backoff = 500; };
+    ws.onopen = () => { $("dot").classList.add("ok"); backoff = 500; lastMsg = performance.now(); };
     ws.onmessage = e => {
+      lastMsg = performance.now();
       try { update(JSON.parse(e.data)); } catch {}
     };
     ws.onclose = () => {
@@ -700,6 +702,15 @@
     ws.onerror = () => { try { ws.close(); } catch {} };
   }
   connect();
+
+  // A suspended PC never sends a FIN, so the socket can go half-open and onclose
+  // never fires -- the dashboard would sit frozen on stale numbers. Close it
+  // ourselves once the stream goes quiet and let onclose drive the reconnect.
+  setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN && performance.now() - lastMsg > 8000) {
+      try { ws.close(); } catch {}
+    }
+  }, 4000);
 
   // tick clock + date independently
   function tickClock() {
