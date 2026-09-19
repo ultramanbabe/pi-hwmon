@@ -99,11 +99,22 @@
   }
   .row .v { color: var(--fg); font-variant-numeric: tabular-nums; }
 
-  canvas.spark {
-    width: 100%;
+  /* The spark canvas is one sample-step WIDER than this wrapper and scrolls via a
+     composited transform, so a frame never repaints it -- the trace is rendered
+     once per sample instead. The wrapper does the clipping. */
+  .sparkwrap {
     height: 48px;
-    display: block;
     margin-top: auto;
+    overflow: hidden;
+  }
+  /* Kiosk: nothing here is clickable, and cage will happily park a pointer on
+     screen the moment any input device exists. Hide it at the page level. */
+  html, body, * { cursor: none !important; }
+
+  canvas.spark {
+    height: 100%;
+    display: block;
+    will-change: transform;
   }
   canvas.netgauge {
     width: 100%;
@@ -218,7 +229,7 @@
       <div class="big" id="cpu-pct">0<span class="unit">%</span></div>
       <div class="row" style="justify-content:flex-end"><span class="v" id="cpu-temp">—</span></div>
       <div class="cores" id="cpu-cores"></div>
-      <canvas class="spark" id="cpu-spark"></canvas>
+      <div class="sparkwrap"><canvas class="spark" id="cpu-spark"></canvas></div>
     </div>
 
     <!-- GPU -->
@@ -228,7 +239,7 @@
       <div class="big" id="gpu-pct">0<span class="unit">%</span></div>
       <div class="row"><span>Edge / Junction / Mem</span><span class="v" id="gpu-temps">—</span></div>
       <div class="row"><span>Power · Fan</span><span class="v" id="gpu-power">—</span></div>
-      <canvas class="spark" id="gpu-spark"></canvas>
+      <div class="sparkwrap"><canvas class="spark" id="gpu-spark"></canvas></div>
     </div>
 
     <!-- RAM -->
@@ -248,14 +259,14 @@
       <div class="big" id="vram-pct">0<span class="unit">%</span></div>
       <div class="row"><span id="vram-used">—</span><span class="v" id="vram-free">—</span></div>
       <div class="bar"><span id="vram-bar" style="background: var(--vram);"></span></div>
-      <canvas class="spark" id="vram-spark"></canvas>
+      <div class="sparkwrap"><canvas class="spark" id="vram-spark"></canvas></div>
     </div>
 
     <!-- Network -->
     <div class="card">
       <h2>Network <span class="sub" id="net-scale">—</span></h2>
       <canvas class="netgauge" id="net-gauge"></canvas>
-      <canvas class="spark" id="net-spark"></canvas>
+      <div class="sparkwrap"><canvas class="spark" id="net-spark"></canvas></div>
     </div>
 
     <!-- Disk / Storage -->
@@ -272,7 +283,7 @@
         </div>
       </div>
       <div class="drives" id="disk-drives"></div>
-      <canvas class="spark" id="disk-spark"></canvas>
+      <div class="sparkwrap"><canvas class="spark" id="disk-spark"></canvas></div>
     </div>
   </div>
 </div>
@@ -283,10 +294,16 @@
 
   const HISTORY = 120;             // ~60s at 2Hz
   const SAMPLE_MS = 500;
-  // A Pi Zero 2W cannot rasterize six canvases at 60 FPS, and aiming at a target
-  // it keeps missing gives uneven frame pacing -- which reads as stutter. A
-  // steady 30 looks smoother than a ragged 45, and data arrives at 2 Hz anyway.
-  const FRAME_MS = 1000 / 30;
+  // Sparklines no longer repaint per frame -- they are rendered once per sample and
+  // scrolled with a composited transform -- so the only canvas a frame can touch is
+  // the net gauge, and that one skips its redraw once the needles settle. That is
+  // what buys back the headroom the old 30 FPS cap was paying for.
+  const FRAME_MS = 1000 / 60;
+  // ...but the gauge is the one thing left that actually rasterizes (arcs + text),
+  // and at 60 it pinned the renderer at a full core. The scroll is the motion the
+  // eye tracks, so scroll at 60 and let the needle keep its old 30 -- it looked
+  // right there for months.
+  const GAUGE_MS = 1000 / 30;
   const SUPERSAMPLE = 1.25;         // canvas oversampling; push back toward 1.5 if there is headroom
   const series = {
     cpu: [], gpu: [], vram: [],
@@ -356,21 +373,45 @@
   // Reading clientWidth inside the render loop forces a synchronous reflow, six
   // times a frame. Measure out of band instead and park the size, context and
   // transform on the canvas, so a frame only has to clear and draw.
+  //
+  // A spark canvas is sized one stepX WIDER than its wrapper: the newest sample is
+  // drawn in that overhang, just past the right edge, and slides into view as the
+  // canvas is translated across the sample window. So the width that matters is the
+  // wrapper's, not the canvas's.
   function sizeCanvas(canvas) {
     const dpr = (window.devicePixelRatio || 1) * SUPERSAMPLE;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    if (!w || !h) return;
+    const spark = canvas.classList.contains("spark");
+    const box = spark ? canvas.parentElement : canvas;
+    const vw = box.clientWidth, h = box.clientHeight;
+    if (!vw || !h) return;
     const st = canvas._st || (canvas._st = {ctx: canvas.getContext("2d")});
+    const stepX = vw / (HISTORY - 1);
+    const w = spark ? vw + stepX : vw;
+    if (spark) canvas.style.width = w + "px";
     const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
     if (canvas.width !== pw || canvas.height !== ph) {
       canvas.width = pw; canvas.height = ph;
     }
-    st.w = w; st.h = h;
+    st.w = w; st.h = h; st.vw = vw; st.stepX = stepX;
+    st.gradKey = null;   // height may have changed -- force the gradient to rebuild
+    st.tx = null;        // force the next scroll to write a transform
+    st.sig = null;       // and the gauge to repaint
     st.ctx.setTransform(dpr,0,0,dpr,0,0);
     st.ctx.imageSmoothingEnabled = true;
   }
-  const canvasRO = new ResizeObserver(es => { for (const e of es) sizeCanvas(e.target); });
-  document.querySelectorAll("canvas").forEach(c => { sizeCanvas(c); canvasRO.observe(c); });
+  // Observe the WRAPPER for sparks: sizeCanvas sets the canvas's own width, so
+  // observing the canvas would feed itself.
+  const canvasRO = new ResizeObserver(es => {
+    for (const e of es) {
+      const c = e.target.classList.contains("sparkwrap") ? e.target.firstElementChild : e.target;
+      sizeCanvas(c);
+      if (c.classList.contains("spark")) renderSparks();
+    }
+  });
+  document.querySelectorAll("canvas").forEach(c => {
+    sizeCanvas(c);
+    canvasRO.observe(c.classList.contains("spark") ? c.parentElement : c);
+  });
 
   function prep(canvas) {
     const st = canvas._st;
@@ -393,16 +434,16 @@
     return st.grad;
   }
 
-  // Build screen points; lerp the most recent point's Y from prev sample
-  // over the sample window so the right edge rises/falls smoothly.
-  function buildPoints(data, max, startX, stepX, h, t) {
-    const pts = new Array(data.length);
-    for (let i = 0; i < data.length; i++) {
-      let v = data[i];
-      if (i === data.length - 1 && i > 0) {
-        v = data[i - 1] + (data[i] - data[i - 1]) * t;
-      }
-      pts[i] = {x: startX + i * stepX, y: h - (v / max) * (h - 4) - 2};
+  // Build screen points, newest last. The newest sits at x = w, i.e. inside the
+  // canvas's one-step overhang past the visible edge, and the scroll transform walks
+  // it in. No Y lerp any more: the point enters at its true value instead of rising
+  // in place, which is what a strip chart actually does -- and the trace has to be
+  // geometrically constant between samples for the composited scroll to be correct.
+  function buildPoints(data, max, w, stepX, h) {
+    const n = data.length;
+    const pts = new Array(n);
+    for (let i = 0; i < n; i++) {
+      pts[i] = {x: w - (n - 1 - i) * stepX, y: h - (data[i] / max) * (h - 4) - 2};
     }
     return pts;
   }
@@ -425,15 +466,13 @@
     ctx.stroke();
   }
 
-  function drawSpark(canvas, name, color, scrollFrac, fill = true) {
+  function renderSpark(canvas, name, color, fill = true) {
     const st = prep(canvas); if (!st) return;
     const {ctx, w, h} = st;
     const data = series[name];
     if (data.length < 2) return;
     const max = Math.max(1, seriesMax[name] || 0);
-    const stepX = w / (HISTORY - 1);
-    const startX = (HISTORY - data.length) * stepX - scrollFrac * stepX;
-    const pts = buildPoints(data, max, startX, stepX, h, scrollFrac);
+    const pts = buildPoints(data, max, w, st.stepX, h);
     ctx.lineWidth = 2.4;
     ctx.strokeStyle = color;
     ctx.lineJoin = "round";
@@ -523,8 +562,7 @@
   }
 
   function drawNetGauge(canvas, dt) {
-    const st = prep(canvas); if (!st) return;
-    const {ctx, w, h} = st;
+    const st = canvas._st; if (!st || !st.w) return;
     // Smooth (lerped) value drives the arc; raw latest sample drives the text — so digits only step at the sample rate.
     const downRaw = series.net_down[series.net_down.length - 1] ?? 0;
     const upRaw = series.net_up[series.net_up.length - 1] ?? 0;
@@ -533,6 +571,16 @@
     const upSmooth = smoothToward(gaugeState, "netUp", upRaw, 160, 160, dt);
     const targetMax = niceMax(Math.max(seriesMax.net_down || 0, seriesMax.net_up || 0, 1));
     const max = smoothToward(gaugeState, "netMax", targetMax, 325, 1400, dt);
+    // This is the only canvas a frame can still repaint, so don't repaint it once the
+    // needles have settled -- on an idle link that is nearly every frame. The raw
+    // values are in the signature too, so the digits can never go stale behind a skip.
+    const eps = max * 0.001;
+    const sig = st.sig;
+    if (sig && Math.abs(sig.d - downSmooth) < eps && Math.abs(sig.u - upSmooth) < eps
+            && Math.abs(sig.m - max) < eps && sig.dr === downRaw && sig.ur === upRaw) return;
+    st.sig = {d: downSmooth, u: upSmooth, m: max, dr: downRaw, ur: upRaw};
+    prep(canvas);
+    const {ctx, w, h} = st;
     const cx1 = w * 0.25, cx2 = w * 0.75;
     const cy = h * 0.46;
     // 3/4 circle: vertical extent ≈ r + r*sin(45°) ≈ 1.71r, plus label below
@@ -544,16 +592,14 @@
     drawGauge(ctx, cx2, cy, r, lw, upSmooth / max, COLORS["net-up"], [uParts[0], uParts[1]], "↑ UP");
   }
 
-  function drawSparkDual(canvas, upName, downName, cUp, cDown, scrollFrac) {
+  function renderSparkDual(canvas, upName, downName, cUp, cDown) {
     const st = prep(canvas); if (!st) return;
     const {ctx, w, h} = st;
     const up = series[upName], down = series[downName];
     if (down.length < 2) return;
     const max = Math.max(1, seriesMax[upName] || 0, seriesMax[downName] || 0);
-    const stepX = w / (HISTORY - 1);
-    const startX = (HISTORY - down.length) * stepX - scrollFrac * stepX;
     const drawLine = (data, color) => {
-      const pts = buildPoints(data, max, startX, stepX, h, scrollFrac);
+      const pts = buildPoints(data, max, w, st.stepX, h);
       ctx.lineWidth = 2.4;
       ctx.strokeStyle = color;
       ctx.lineJoin = "round";
@@ -677,6 +723,9 @@
     pushSeries("disk_r", disk.read_bps ?? 0);
     pushSeries("disk_w", disk.write_bps ?? 0);
     renderDrives(disk.drives || []);
+
+    // New sample -> the traces change shape. Between samples they only translate.
+    renderSparks();
   }
 
   function renderDrives(drives) {
@@ -721,22 +770,45 @@
 
   // Continuous render loop, capped at FRAME_MS
   let lastFrame = 0;
+  let lastGauge = 0;
   const cvCpu = $("cpu-spark"), cvGpu = $("gpu-spark"), cvVram = $("vram-spark"),
         cvNetG = $("net-gauge"), cvNetS = $("net-spark"), cvDisk = $("disk-spark");
+  // Traces are rendered once per sample. This is the only place they repaint.
+  function renderSparks() {
+    renderSpark(cvCpu, "cpu", COLORS["cpu"]);
+    renderSpark(cvGpu, "gpu", COLORS["gpu"]);
+    renderSpark(cvVram, "vram", COLORS["vram"]);
+    renderSparkDual(cvNetS, "net_up", "net_down", COLORS["net-up"], COLORS["net-down"]);
+    renderSparkDual(cvDisk, "disk_w", "disk_r", COLORS["disk-w"], COLORS["disk-r"]);
+  }
+
+  // Composited scroll: no repaint, no texture re-upload -- the compositor just moves
+  // a layer it already has. This is the whole reason a frame is cheap now, and the
+  // reason the cap above could go back up to 60.
+  const SPARKS = [cvCpu, cvGpu, cvVram, cvNetS, cvDisk];
+  function scrollSparks(t) {
+    for (const c of SPARKS) {
+      const st = c._st; if (!st || !st.stepX) continue;
+      const x = -t * st.stepX;
+      if (st.tx === x) continue;
+      st.tx = x;
+      c.style.transform = `translate3d(${x.toFixed(2)}px,0,0)`;
+    }
+  }
+
   function frame(now) {
     requestAnimationFrame(frame);
     const dt = now - lastFrame;
     if (dt < FRAME_MS - 1) return;
     lastFrame = now;
     const t = Math.min(1, (now - lastSampleAt) / SAMPLE_MS);
-    // Clamp so a stall (GC pause, a reconnect) doesn't teleport the gauge needle.
-    const step = Math.min(dt, 250);
-    drawSpark(cvCpu, "cpu", COLORS["cpu"], t);
-    drawSpark(cvGpu, "gpu", COLORS["gpu"], t);
-    drawSpark(cvVram, "vram", COLORS["vram"], t);
-    drawNetGauge(cvNetG, step);
-    drawSparkDual(cvNetS, "net_up", "net_down", COLORS["net-up"], COLORS["net-down"], t);
-    drawSparkDual(cvDisk, "disk_w", "disk_r", COLORS["disk-w"], COLORS["disk-r"], t);
+    scrollSparks(t);
+    // Pass time since the last GAUGE draw, not since the last frame -- the needle's
+    // smoothing is a time constant, so feeding it a frame dt would halve its rate.
+    if (now - lastGauge >= GAUGE_MS - 1) {
+      drawNetGauge(cvNetG, Math.min(now - lastGauge, 250));
+      lastGauge = now;
+    }
   }
   requestAnimationFrame(frame);
 
