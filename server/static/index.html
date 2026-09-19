@@ -115,7 +115,10 @@
   .bar {
     height: 14px; background: #4a5868; border-radius: 4px; overflow: hidden;
   }
-  .bar > span { display: block; height: 100%; width: 0%; transition: width .5s linear; border-radius: 4px; }
+  /* No width transition. These bars crawl, and a width animation keeps layout
+     dirty on every frame -- which turns each canvas measurement in the render
+     loop into a forced reflow. They just step at the 2 Hz sample rate. */
+  .bar > span { display: block; height: 100%; width: 0%; border-radius: 4px; }
 
   .cores {
     display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px;
@@ -128,9 +131,15 @@
     position: relative; overflow: hidden;
   }
   .core > i {
-    position: absolute; left: 0; bottom: 0; width: 100%;
+    position: absolute; left: 0; bottom: 0; width: 100%; height: 100%;
     background: linear-gradient(to top, var(--cpu), #9bc2ff);
-    transition: height .45s linear;
+    /* Animate scaleY rather than height: a transform is composited, so the 16
+       thread bars never dirty layout. A vertically squashed linear gradient is
+       identical to the same gradient painted in the shorter box, so this is a
+       pixel-for-pixel match of the old look. */
+    transform: scaleY(0); transform-origin: bottom;
+    transition: transform .45s linear;
+    will-change: transform;
   }
   .core::after {
     content: ""; position: absolute; inset: 0;
@@ -274,12 +283,17 @@
 
   const HISTORY = 120;             // ~60s at 2Hz
   const SAMPLE_MS = 500;
-  const FRAME_MS = 1000 / 60;       // cap render at 60 FPS
+  // A Pi Zero 2W cannot rasterize six canvases at 60 FPS, and aiming at a target
+  // it keeps missing gives uneven frame pacing -- which reads as stutter. A
+  // steady 30 looks smoother than a ragged 45, and data arrives at 2 Hz anyway.
+  const FRAME_MS = 1000 / 30;
+  const SUPERSAMPLE = 1.25;         // canvas oversampling; push back toward 1.5 if there is headroom
   const series = {
     cpu: [], gpu: [], vram: [],
     net_up: [], net_down: [],
     disk_r: [], disk_w: [],
   };
+  const seriesMax = {};             // name -> peak, recomputed on push, not per frame
   let lastSampleAt = performance.now();
   const COL = name => getComputedStyle(document.documentElement).getPropertyValue('--' + name).trim();
   const COLORS = {};
@@ -339,17 +353,44 @@
   }
   const escHtml = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-  function prep(canvas) {
-    const dpr = (window.devicePixelRatio || 1) * 1.5;   // 1.5× super-sample — smooth but cheap on Pi Zero
+  // Reading clientWidth inside the render loop forces a synchronous reflow, six
+  // times a frame. Measure out of band instead and park the size, context and
+  // transform on the canvas, so a frame only has to clear and draw.
+  function sizeCanvas(canvas) {
+    const dpr = (window.devicePixelRatio || 1) * SUPERSAMPLE;
     const w = canvas.clientWidth, h = canvas.clientHeight;
-    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-      canvas.width = w * dpr; canvas.height = h * dpr;
+    if (!w || !h) return;
+    const st = canvas._st || (canvas._st = {ctx: canvas.getContext("2d")});
+    const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw; canvas.height = ph;
     }
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.imageSmoothingEnabled = true;
-    ctx.clearRect(0,0,w,h);
-    return {ctx, w, h};
+    st.w = w; st.h = h;
+    st.ctx.setTransform(dpr,0,0,dpr,0,0);
+    st.ctx.imageSmoothingEnabled = true;
+  }
+  const canvasRO = new ResizeObserver(es => { for (const e of es) sizeCanvas(e.target); });
+  document.querySelectorAll("canvas").forEach(c => { sizeCanvas(c); canvasRO.observe(c); });
+
+  function prep(canvas) {
+    const st = canvas._st;
+    if (!st || !st.w) return null;
+    st.ctx.clearRect(0, 0, st.w, st.h);
+    return st;
+  }
+
+  // One spark canvas only ever paints one colour, so a single cached gradient
+  // per canvas replaces a createLinearGradient on every frame.
+  function areaGradient(st, color) {
+    const key = color + "@" + st.h;
+    if (st.gradKey !== key) {
+      const g = st.ctx.createLinearGradient(0, 0, 0, st.h);
+      g.addColorStop(0, color + "aa");
+      g.addColorStop(0.5, color + "55");
+      g.addColorStop(1, color + "10");
+      st.grad = g; st.gradKey = key;
+    }
+    return st.grad;
   }
 
   // Build screen points; lerp the most recent point's Y from prev sample
@@ -384,10 +425,12 @@
     ctx.stroke();
   }
 
-  function drawSpark(canvas, data, color, scrollFrac, fill = true) {
-    const {ctx, w, h} = prep(canvas);
+  function drawSpark(canvas, name, color, scrollFrac, fill = true) {
+    const st = prep(canvas); if (!st) return;
+    const {ctx, w, h} = st;
+    const data = series[name];
     if (data.length < 2) return;
-    const max = Math.max(1, ...data);
+    const max = Math.max(1, seriesMax[name] || 0);
     const stepX = w / (HISTORY - 1);
     const startX = (HISTORY - data.length) * stepX - scrollFrac * stepX;
     const pts = buildPoints(data, max, startX, stepX, h, scrollFrac);
@@ -399,11 +442,7 @@
       ctx.lineTo(pts[pts.length - 1].x, h);
       ctx.lineTo(pts[0].x, h);
       ctx.closePath();
-      const grad = ctx.createLinearGradient(0, 0, 0, h);
-      grad.addColorStop(0, color + "aa");
-      grad.addColorStop(0.5, color + "55");
-      grad.addColorStop(1, color + "10");
-      ctx.fillStyle = grad;
+      ctx.fillStyle = areaGradient(st, color);
       ctx.fill();
     }
   }
@@ -432,10 +471,16 @@
 
   // Continuous exponential smoothing — no discrete lerp segments, so the needle never
   // "restarts" at sample boundaries. State is chased toward target every frame.
+  //
+  // The chase rate is a time constant in ms, not a per-frame factor. The Pi does
+  // not hold a fixed frame rate, and with a fixed per-frame factor the needle
+  // settled 3-4x slower whenever the rate dipped — it visibly trailed the digits,
+  // which is exactly what read as lag. Tau values match the old rates at 60 FPS.
   const gaugeState = { netMax: 1024 * 1024, netDown: 0, netUp: 0 };
-  function smoothToward(state, key, target, kUp, kDown) {
+  function smoothToward(state, key, target, tauUp, tauDown, dt) {
     const cur = state[key];
-    const k = target > cur ? kUp : kDown;
+    const tau = target > cur ? tauUp : tauDown;
+    const k = 1 - Math.exp(-dt / tau);
     state[key] = cur + (target - cur) * k;
     return state[key];
   }
@@ -477,16 +522,17 @@
     ctx.fillText(label, cx, cy + r + lw * 0.6);
   }
 
-  function drawNetGauge(canvas, t) {
-    const {ctx, w, h} = prep(canvas);
+  function drawNetGauge(canvas, dt) {
+    const st = prep(canvas); if (!st) return;
+    const {ctx, w, h} = st;
     // Smooth (lerped) value drives the arc; raw latest sample drives the text — so digits only step at the sample rate.
     const downRaw = series.net_down[series.net_down.length - 1] ?? 0;
     const upRaw = series.net_up[series.net_up.length - 1] ?? 0;
     // Continuous chase toward target each frame — no segment boundaries → no stutter.
-    const downSmooth = smoothToward(gaugeState, "netDown", downRaw, 0.10, 0.10);
-    const upSmooth = smoothToward(gaugeState, "netUp", upRaw, 0.10, 0.10);
-    const targetMax = niceMax(Math.max(...series.net_down, ...series.net_up, 1));
-    const max = smoothToward(gaugeState, "netMax", targetMax, 0.05, 0.012);
+    const downSmooth = smoothToward(gaugeState, "netDown", downRaw, 160, 160, dt);
+    const upSmooth = smoothToward(gaugeState, "netUp", upRaw, 160, 160, dt);
+    const targetMax = niceMax(Math.max(seriesMax.net_down || 0, seriesMax.net_up || 0, 1));
+    const max = smoothToward(gaugeState, "netMax", targetMax, 325, 1400, dt);
     const cx1 = w * 0.25, cx2 = w * 0.75;
     const cy = h * 0.46;
     // 3/4 circle: vertical extent ≈ r + r*sin(45°) ≈ 1.71r, plus label below
@@ -498,10 +544,12 @@
     drawGauge(ctx, cx2, cy, r, lw, upSmooth / max, COLORS["net-up"], [uParts[0], uParts[1]], "↑ UP");
   }
 
-  function drawSparkDual(canvas, up, down, cUp, cDown, scrollFrac) {
-    const {ctx, w, h} = prep(canvas);
+  function drawSparkDual(canvas, upName, downName, cUp, cDown, scrollFrac) {
+    const st = prep(canvas); if (!st) return;
+    const {ctx, w, h} = st;
+    const up = series[upName], down = series[downName];
     if (down.length < 2) return;
-    const max = Math.max(1, ...up, ...down);
+    const max = Math.max(1, seriesMax[upName] || 0, seriesMax[downName] || 0);
     const stepX = w / (HISTORY - 1);
     const startX = (HISTORY - down.length) * stepX - scrollFrac * stepX;
     const drawLine = (data, color) => {
@@ -531,6 +579,11 @@
     }
     arr.push(v);
     if (arr.length > HISTORY) arr.shift();
+    // Recompute the peak here (2 Hz) instead of spreading a 120-element array
+    // into Math.max on every canvas on every frame.
+    let m = 0;
+    for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i];
+    seriesMax[name] = m;
   }
 
   function ensureCores(n) {
@@ -569,7 +622,7 @@
       // Avoids the visual "popping" of low loads — always at least the baseline.
       cpu.per_core.forEach((p, i) => {
         const eff = Math.max(2.5, p);
-        cores[i].firstElementChild.style.height = eff + "%";
+        cores[i].firstElementChild.style.transform = "scaleY(" + (eff / 100).toFixed(4) + ")";
       });
     }
 
@@ -666,19 +719,24 @@
     });
   }
 
-  // Continuous render loop, capped at 60 FPS
+  // Continuous render loop, capped at FRAME_MS
   let lastFrame = 0;
+  const cvCpu = $("cpu-spark"), cvGpu = $("gpu-spark"), cvVram = $("vram-spark"),
+        cvNetG = $("net-gauge"), cvNetS = $("net-spark"), cvDisk = $("disk-spark");
   function frame(now) {
     requestAnimationFrame(frame);
-    if (now - lastFrame < FRAME_MS - 1) return;
+    const dt = now - lastFrame;
+    if (dt < FRAME_MS - 1) return;
     lastFrame = now;
     const t = Math.min(1, (now - lastSampleAt) / SAMPLE_MS);
-    drawSpark($("cpu-spark"), series.cpu, COLORS["cpu"], t);
-    drawSpark($("gpu-spark"), series.gpu, COLORS["gpu"], t);
-    drawSpark($("vram-spark"), series.vram, COLORS["vram"], t);
-    drawNetGauge($("net-gauge"), t);
-    drawSparkDual($("net-spark"), series.net_up, series.net_down, COLORS["net-up"], COLORS["net-down"], t);
-    drawSparkDual($("disk-spark"), series.disk_w, series.disk_r, COLORS["disk-w"], COLORS["disk-r"], t);
+    // Clamp so a stall (GC pause, a reconnect) doesn't teleport the gauge needle.
+    const step = Math.min(dt, 250);
+    drawSpark(cvCpu, "cpu", COLORS["cpu"], t);
+    drawSpark(cvGpu, "gpu", COLORS["gpu"], t);
+    drawSpark(cvVram, "vram", COLORS["vram"], t);
+    drawNetGauge(cvNetG, step);
+    drawSparkDual(cvNetS, "net_up", "net_down", COLORS["net-up"], COLORS["net-down"], t);
+    drawSparkDual(cvDisk, "disk_w", "disk_r", COLORS["disk-w"], COLORS["disk-r"], t);
   }
   requestAnimationFrame(frame);
 

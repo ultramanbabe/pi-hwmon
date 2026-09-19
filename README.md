@@ -2,7 +2,7 @@
 
 Always-on hardware monitor for a Linux desktop, displayed on a tiny Pi-driven side screen.
 
-A FastAPI/WebSocket server runs on the PC and reads CPU, GPU, RAM, drives, and network stats via sysfs / RAPL / `smartctl`. A Raspberry Pi Zero 2W with a 7″ 1024×600 HDMI panel runs Chromium in kiosk mode and shows the dashboard at ~60 fps with smooth gauges and sparklines.
+A FastAPI/WebSocket server runs on the PC and reads CPU, GPU, RAM, drives, and network stats via sysfs / RAPL / `smartctl`. A Raspberry Pi Zero 2W with a 7″ 1024×600 HDMI panel runs Chromium in kiosk mode and shows the dashboard at a steady 30 fps with smooth gauges and sparklines.
 
 ## Hardware tested on
 
