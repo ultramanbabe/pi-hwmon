@@ -22,13 +22,15 @@ Open `http://localhost:8765` in any browser to verify.
 
 ## Pi kiosk
 
-On the Pi (Raspberry Pi OS Lite):
+Everything the Pi runs is in [`pi/`](pi/) — units, launcher, panel watcher and the
+blank cursor theme, as deployed, with install order in [`pi/README.md`](pi/README.md).
 
 ```sh
-sudo apt install -y cage chromium
+sudo apt install -y cage chromium wlr-randr
 ```
 
-Then a systemd unit `/etc/systemd/system/hwmon-kiosk.service` launches `cage -s -- /usr/local/bin/hwmon-kiosk.sh`, which `exec`s Chromium with:
+`hwmon-kiosk.service` runs `cage -s -- /usr/local/bin/hwmon-kiosk.sh` on tty1, which
+waits for the server to answer before `exec`ing Chromium with:
 
 ```
 --kiosk --noerrdialogs --disable-infobars --no-first-run
@@ -38,7 +40,19 @@ Then a systemd unit `/etc/systemd/system/hwmon-kiosk.service` launches `cage -s 
 http://<pc-lan-ip>:8765
 ```
 
-Cursor is hidden via a blank xcursor theme placed at `/usr/share/icons/blank/`.
+That wait matters: Chromium's network error page carries no JS, so a kiosk started
+while the PC is down parks on it forever. For the same reason the daily restart timer
+is gated on the server being reachable.
+
+Two extras alongside it:
+
+- **The panel sleeps with the PC.** `hwmon-screen.service` probes the server every 5s
+  and drives `wlr-randr --output HDMI-A-1 --off/--on`, so the display follows the PC
+  through shutdown, reboot and suspend alike.
+- **The cursor is blanked with an xcursor theme named `default`** — installed to both
+  `~/.icons/default/` and `/usr/share/icons/default/cursors/`. cage asks for `left_ptr`
+  from the theme `default` and reads only `XCURSOR_PATH`; `XCURSOR_THEME` is not read
+  at all, so a theme installed under any other name has no effect.
 
 ## Optional one-time host setup
 

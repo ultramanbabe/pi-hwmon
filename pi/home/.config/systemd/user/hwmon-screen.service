@@ -1,0 +1,15 @@
+[Unit]
+Description=Blank the hwmon kiosk panel while the PC is down
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hwmon-screen-watch.sh
+# Never leave the panel dark if the watcher itself goes away.
+ExecStopPost=-/usr/bin/wlr-randr --output HDMI-A-1 --on
+Environment=WAYLAND_DISPLAY=wayland-0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the hwmon kiosk (reclaims renderer memory)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart hwmon-kiosk.service
